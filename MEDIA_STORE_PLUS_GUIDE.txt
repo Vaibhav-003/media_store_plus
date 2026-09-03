@@ -1,0 +1,287 @@
+================================================================================
+MEDIA_STORE_PLUS IMPLEMENTATION GUIDE & PATHACCESSEXCEPTION CHECKLIST
+Targeting Android 10 (API 29) & Scoped Storage (API 29 - 34+)
+================================================================================
+
+--------------------------------------------------------------------------------
+PART 1: CRITICAL CHECKLIST - CAUSES OF PathAccessException & HOW TO PREVENT THEM
+--------------------------------------------------------------------------------
+
+A `PathAccessException (OS Error: Permission denied, errno = 13)` occurs when
+the operating system or Android security layer rejects file access. 
+Below are the most common root causes in this setup and how to prevent them:
+
+1. MISSING `android:requestLegacyExternalStorage="true"` IN AndroidManifest.xml
+   - Why it fails: Android 10 (API 29) introduced Scoped Storage. By default, 
+     raw file path operations to shared storage are restricted.
+   - Fix: In `android/app/src/main/AndroidManifest.xml`, ensure your `<application>`
+     tag includes:
+       android:requestLegacyExternalStorage="true"
+     Without this, file access on Android 10 will immediately throw 
+     PathAccessException.
+
+2. MISSING RUNTIME STORAGE PERMISSION CHECK (API <= 32)
+   - Why it fails: Declaring permissions in `AndroidManifest.xml` is NOT enough.
+     On Android 10 (API 29), storage permissions are dangerous permissions 
+     and MUST be requested at runtime using `permission_handler`.
+   - Fix: Always request runtime permission before file operations:
+       if (Platform.isAndroid) {
+         final sdk = await mediaStorePlugin.getPlatformSDKInt();
+         if (sdk <= 32) {
+           final status = await Permission.storage.request();
+           if (!status.isGranted) {
+             // Abort: writing without granted permission throws PathAccessException
+             return;
+           }
+         }
+       }
+
+3. MISSING `WRITE_EXTERNAL_STORAGE` IN AndroidManifest.xml
+   - Why it fails: While Android 11+ (API 30+) uses MediaStore without write 
+     permissions, Android 10 (API 29) and lower still require 
+     `WRITE_EXTERNAL_STORAGE`.
+   - Fix: Add with `android:maxSdkVersion="29"`:
+       <uses-permission 
+           android:name="android.permission.WRITE_EXTERNAL_STORAGE" 
+           android:maxSdkVersion="29" />
+
+4. TRYING TO WRITE DIRECTLY TO PUBLIC PATHS WITH `File.writeAsBytes()`
+   - Why it fails: In Flutter, code like:
+       File('/storage/emulated/0/Download/myfile.png').writeAsBytes(...)
+     will IMMEDIATELY crash with PathAccessException on Android 10+.
+   - Fix: ALWAYS write your data into your app's sandbox cache first:
+       final tempDir = await getTemporaryDirectory();
+       final tempFile = File('${tempDir.path}/temp_file.png');
+       await tempFile.writeAsBytes(bytes);
+     Then hand the cache path to MediaStore:
+       await mediaStorePlugin.saveFile(
+         tempFilePath: tempFile.path,
+         dirType: DirType.download,
+         dirName: DirType.download.defaults,
+         relativePath: "YourAppFolder",
+       );
+
+5. FORGETTING `MediaStore.appFolder` (AppFolderNotSetException)
+   - Why it fails: The plugin requires a top-level folder name to group saved
+     files under shared directories.
+   - Fix: Set `MediaStore.appFolder = "YourAppName";` before calling saveFile().
+
+6. UNINITIALIZED PLUGIN BINDINGS
+   - Why it fails: Calling plugin functions before Android channel initialization
+     fails to detect the platform SDK version.
+   - Fix: Call `await MediaStore.ensureInitialized();` before saving.
+
+7. APP REINSTALLATION CONFLICT (File Ownership Loss)
+   - Why it fails: On Android 10+, an app "owns" the files it creates in 
+     MediaStore. If you uninstall and reinstall the app, Android treats the new 
+     install as a different app instance. If you attempt to overwrite an existing 
+     file with the exact same name without user consent, it throws access errors.
+   - Fix: Use unique timestamps or UUIDs for file names:
+       final fileName = "image_${DateTime.now().millisecondsSinceEpoch}.webp";
+
+
+--------------------------------------------------------------------------------
+PART 2: STEP-BY-STEP IMPLEMENTATION GUIDE
+--------------------------------------------------------------------------------
+
+STEP 1: ADD DEPENDENCIES IN pubspec.yaml
+---------------------------------------
+Open `pubspec.yaml` and add:
+```yaml
+dependencies:
+  flutter:
+    sdk: flutter
+  media_store_plus: ^0.1.3
+  permission_handler: 11.3.1
+  path_provider: ^2.1.5
+```
+* Note: Keep `permission_handler` pinned to 11.3.1 to avoid Gradle Kotlin DSL
+  conflicts present in newer versions. Run `flutter pub get`.
+
+
+STEP 2: UPDATE AndroidManifest.xml
+----------------------------------
+File: `android/app/src/main/AndroidManifest.xml`
+
+```xml
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Permissions required for Android 10 (API 29) and lower -->
+    <uses-permission 
+        android:name="android.permission.READ_EXTERNAL_STORAGE" 
+        android:maxSdkVersion="32" />
+    <uses-permission 
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE" 
+        android:maxSdkVersion="29" />
+
+    <application
+        android:label="media_store_demo"
+        android:name="${applicationName}"
+        android:icon="@mipmap/ic_launcher"
+        android:requestLegacyExternalStorage="true">
+        
+        <!-- Activity and existing configurations... -->
+        
+    </application>
+</manifest>
+```
+
+* Why `maxSdkVersion="29"` is essential:
+  Google Play Store strictly rejects apps requesting WRITE_EXTERNAL_STORAGE 
+  on Android 11+ (API 30+). Specifying `android:maxSdkVersion="29"` ensures 
+  Android 10 gets write capability while complying 100% with Google Play policy.
+
+
+STEP 3: ADD PROGUARD RULES (Required for Release Builds)
+-------------------------------------------------------
+Create/Update: `android/app/proguard-rules.pro`
+Because `media_store_plus` uses Google GSON internally, code minification (R8) 
+will break release builds unless these rules exist:
+
+```pro
+-keepattributes Signature
+-keepattributes *Annotation*
+-dontwarn sun.misc.**
+-keep class com.google.gson.** { *; }
+-keep class * implements com.google.gson.TypeAdapterFactory
+-keep class * implements com.google.gson.JsonSerializer
+-keep class * implements com.google.gson.JsonDeserializer
+```
+
+
+STEP 4: COMPLETE DART IMPLEMENTATION (lib/main.dart)
+---------------------------------------------------
+```dart
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:flutter/material.dart';
+import 'package:media_store_plus/media_store_plus.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:permission_handler/permission_handler.dart';
+
+final mediaStorePlugin = MediaStore();
+const String kAppFolder = "MySavedFiles";
+
+void main() {
+  runApp(const MyApp());
+}
+
+class MyApp extends StatelessWidget {
+  const MyApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return const MaterialApp(
+      home: FileSaveScreen(),
+    );
+  }
+}
+
+class FileSaveScreen extends StatefulWidget {
+  const FileSaveScreen({super.key});
+
+  @override
+  State<FileSaveScreen> createState() => _FileSaveScreenState();
+}
+
+class _FileSaveScreenState extends State<FileSaveScreen> {
+  bool _isSaving = false;
+
+  Future<void> _saveFile() async {
+    setState(() => _isSaving = true);
+
+    try {
+      // 1. Initialize plugin and set app folder
+      if (Platform.isAndroid) {
+        await MediaStore.ensureInitialized();
+      }
+      MediaStore.appFolder = kAppFolder;
+
+      // 2. Handle runtime permissions for Android 10 (API 29)
+      if (Platform.isAndroid) {
+        final sdk = await mediaStorePlugin.getPlatformSDKInt();
+        if (sdk >= 33) {
+          // Android 13+ granular permission (if saving to photos)
+          await Permission.photos.request();
+        } else {
+          // Android 10 (API 29) storage permission
+          final status = await Permission.storage.request();
+          if (!status.isGranted) {
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text("Storage permission denied.")),
+              );
+            }
+            return;
+          }
+        }
+      }
+
+      // 3. Write bytes to app's temporary cache (prevents PathAccessException)
+      final tempDir = await getTemporaryDirectory();
+      final fileName = "file_${DateTime.now().millisecondsSinceEpoch}.png";
+      final tempFile = File("${tempDir.path}/$fileName");
+      
+      // Example: raw bytes (e.g. from base64Decode or image generator)
+      final List<int> fileBytes = [/* your byte data */];
+      await tempFile.writeAsBytes(fileBytes);
+
+      // 4. Hand off to MediaStore (saves to Download or Pictures)
+      final saveInfo = await mediaStorePlugin.saveFile(
+        tempFilePath: tempFile.path,
+        dirType: DirType.download,          // or DirType.photo
+        dirName: DirType.download.defaults, // or DirType.photo.defaults
+        relativePath: kAppFolder,
+      );
+
+      final isSuccess = saveInfo?.uri != null;
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              isSuccess ? "File saved: ${saveInfo!.uri}" : "Save failed",
+            ),
+            backgroundColor: isSuccess ? Colors.green : Colors.red,
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("Error: $e"), backgroundColor: Colors.red),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isSaving = false);
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Save File Demo')),
+      body: Center(
+        child: ElevatedButton.icon(
+          onPressed: _isSaving ? null : _saveFile,
+          icon: const Icon(Icons.save_alt),
+          label: Text(_isSaving ? 'Saving...' : 'Save File'),
+        ),
+      ),
+    );
+  }
+}
+```
+
+--------------------------------------------------------------------------------
+PART 3: SUMMARY OF GOOGLE PLAY STORE COMPLIANCE RULES
+--------------------------------------------------------------------------------
+1. NEVER include `android.permission.MANAGE_EXTERNAL_STORAGE` (Auto-rejection).
+2. NEVER include `READ_MEDIA_AUDIO` or `READ_MEDIA_VIDEO` unless your app is a 
+   dedicated audio/video player.
+3. ALWAYS specify `android:maxSdkVersion="29"` on `WRITE_EXTERNAL_STORAGE`.
+4. Change `applicationId` in `android/app/build.gradle.kts` from `com.example.*` 
+   to your real domain prior to Play Console submission.
+================================================================================
